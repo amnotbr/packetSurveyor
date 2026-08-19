@@ -1,0 +1,318 @@
+#define DEFAULT_FILEPATH "knownmac.txt"
+#define STRING_MATCH 0
+#define CHAR_MAC_BUFF_SIZE 14
+
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <arpa/inet.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
+#include <net/ethernet.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+
+#include <errno.h>
+#include <linux/if_arp.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <unistd.h>
+
+#include "include/log.h"
+#include "include/init.h"
+
+
+struct ArpHdr {
+  uint16_t hardwareType;
+  uint16_t protocolType;
+  uint8_t hardwareLength;
+  uint8_t protocolLength;
+  uint16_t operation;
+  uint8_t senderHWAddress[6];  // sender Hardware address
+  uint32_t senderProtoAddress[INET_ADDRSTRLEN]; // Sender Protocol Address
+  uint8_t targetHWAddress[6];  // Target Hardware Address
+  uint32_t targetProtoAddress[INET_ADDRSTRLEN]; // targtet Ip address
+} __attribute__((packed));
+
+
+
+char *computerInfo(int sockfd) {
+  int sys_call = 0;
+  char *buffer = (char *)malloc(9);
+  buffer[sizeof(buffer) - 1] = '\0';
+
+  struct ifreq ifr;
+  strcpy(ifr.ifr_name, "wlp6s0");
+  // use SIOCGIFHWADDR
+  // for the ioctl syscall
+
+  sys_call = ioctl(sockfd, SIOCGIFHWADDR, &ifr);
+  close(sockfd);
+  if (sys_call < 0) {
+    log_fatal("Error ioctl sys_call: %s\n", strerror(errno));
+    exit(-1);
+  }
+
+  unsigned char *mac = (unsigned char *)ifr.ifr_hwaddr.sa_data;
+
+  for (long unsigned int assign = 0; assign < sizeof(buffer); ++assign) {
+    if (mac[assign] != '\0') {
+      buffer[assign] = mac[assign];
+    }
+  }
+
+  return (char *)buffer;
+}
+
+
+
+int sockInit() {
+  int sockfd;
+  int sockfd_bind;
+
+  sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+  if (sockfd < 0) {
+    log_error("Error sockfd: %s\n", strerror(errno));
+    close(sockfd);
+    return -1;
+  }
+
+  log_info("sockfd_success: %d\n", sockfd);
+
+  struct sockaddr_ll local_struct = {0};
+  local_struct.sll_protocol = htons(ETH_P_ALL);
+  local_struct.sll_family = AF_PACKET;
+  local_struct.sll_ifindex = if_nametoindex("wlp6s0");
+
+  sockfd_bind =
+      bind(sockfd, (struct sockaddr *)&local_struct, sizeof(local_struct));
+  if (sockfd_bind < 0) {
+    log_error("Error sockfd_bind: %s\n", strerror(errno));
+    close(sockfd);
+    return -1;
+  }
+
+  return (int)sockfd;
+}
+
+
+
+void printBuffer(char *buffer) {
+  for (int iter = 0; iter < 43; iter++) {
+    fprintf(stderr, "%02x ", buffer[iter]);
+  }
+  puts("\n");
+}
+
+
+
+int16_t getFileSize(char *fname)
+{
+  FILE *fptr = fopen(fname, "r");
+  if (fptr == NULL)
+    return -1;
+
+  int16_t fsize = 0;
+
+  fseek(fptr, 0, SEEK_END);
+  fsize = ftell(fptr);
+  fseek(fptr, 0, SEEK_SET);
+
+  fclose(fptr);
+  return fsize;
+}
+
+
+
+// TODO: instead of linear searc, since all macs are same size_t
+// implement a check at end of string automatically
+// instead of for loop
+void removeNewLine(char *buffer, size_t arr_size)
+{
+  int iter;
+  for (iter = 0; iter < arr_size; ++iter)
+  {
+    if (buffer[iter] == '\n')
+    {
+      buffer[iter] = '\0';
+      break;
+    }
+  }
+}
+
+
+
+// TODO: Build an analysis engine
+void *analyzeArpAddr(char *macSrc, char *macDst, char *ipSrc, char *ipDst)
+{
+  FILE *fptr = NULL;
+  char r_buff[CHAR_MAC_BUFF_SIZE];
+
+  fptr = fopen(DEFAULT_FILEPATH, "a+");
+  if (fptr == NULL)
+  {
+    log_fatal("Error opening : %s\n", DEFAULT_FILEPATH);
+    fclose(fptr);
+    exit(-1);
+  }
+
+
+  char *lin_search = NULL;
+  bool src_clear = true;
+  bool dst_clear = true;
+  while ((lin_search = fgets(r_buff, CHAR_MAC_BUFF_SIZE, fptr)) != NULL) // sizeof(r_buff) is causing error
+  {
+    removeNewLine(r_buff, CHAR_MAC_BUFF_SIZE);
+    if (strcmp(r_buff, macSrc) == STRING_MATCH)
+    {
+      src_clear = false;
+    }
+    if (strcmp(r_buff, macDst) == STRING_MATCH)
+    {
+      dst_clear = false;
+    }
+  }
+
+
+  if(src_clear == true)
+  {
+    log_info("NEW MAC DETECTED\n");
+    fprintf(fptr, "%s\n", macSrc);
+  }
+  if (dst_clear == true)
+  {
+    log_info("NEW MAC DETECTED");
+    fprintf(fptr, "%s\n", macDst);
+  }
+
+
+  fclose(fptr);
+  return NULL;
+}
+
+
+
+
+int main(void) {
+  string_view info = { 0 };
+  int getInfoStatus = 0;
+
+  getInfoStatus = getLocalIp(&info);
+  if (getInfoStatus == -1)
+  {
+    log_error("Error getLocalIp()\n");
+    exit(-1);
+  }
+
+  int sockfd = sockInit();
+
+  struct sockaddr_ll addr_accept = {0};
+  socklen_t addr_accept_size = sizeof(addr_accept);
+
+  char buffer[256];
+  int sockfd_recvfrom = 0;
+
+  if (sockfd == -1) {
+    log_fatal("Error sockfdInit\n");
+    exit(-1);
+  }
+
+  while (true) {
+    sockfd_recvfrom =
+        recvfrom(sockfd, buffer, sizeof(buffer), 0,
+                 (struct sockaddr *)&addr_accept, &addr_accept_size);
+    if (sockfd_recvfrom < 0) {
+      log_error("Error recvfrom: %s\n", strerror(errno));
+    }
+
+    struct ethhdr *hdr = (struct ethhdr *)buffer;
+    if (ntohs(hdr->h_proto) == ETH_P_IP) {
+      struct iphdr *ip = (struct iphdr *)(buffer + sizeof(struct ethhdr));
+
+      char src[INET_ADDRSTRLEN];
+      char dst[INET_ADDRSTRLEN];
+      inet_ntop(AF_INET, &ip->saddr, src, sizeof(src));
+      inet_ntop(AF_INET, &ip->daddr, dst, sizeof(dst));
+
+      if ((strcmp(src, "192.168.68.103") != 0) &&
+          (strcmp(dst, "192.168.68.76") != 0)) // ignore local ip addr
+      {
+        switch (ip->protocol) {
+          case 1: // ICMP
+            fprintf(stderr, "%s -> %s : ICMP\ndata: %s\n\n", src, dst, buffer);
+            break;
+          case 2:
+            fprintf(stderr, "%s -> %s : IGMP\ndata: %s\n\n", src, dst, buffer);
+            break;
+          case 6:
+            fprintf(stderr, "%s -> %s : TCP\ndata: %s\n\n", src, dst, buffer);
+            break;
+          case 17:
+            fprintf(stderr, "%s -> %s : UDP\ndata: %s\n\n", src, dst, buffer);
+            break;
+          case 41:
+            fprintf(stderr, "%s -> %s : ENCAP\ndata: %s\n\n", src, dst, buffer);
+            break;
+          case 89:
+            fprintf(stderr, "%s -> %s : OSPF\ndata: %s\n\n", src, dst, buffer);
+            break;
+          case 132:
+            fprintf(stderr, "%s -> %s : SCTP\ndata: %s\n\n", src, dst, buffer);
+            break;
+        }
+      }
+    }
+
+    if (ntohs(hdr->h_proto) == ETH_P_ARP) {
+      struct ArpHdr *ahdr = (struct ArpHdr *)(buffer + sizeof(struct ethhdr));
+      ahdr->hardwareType = 1;
+      ahdr->protocolType = 0x0800;
+      ahdr->protocolLength = 4;
+      ahdr->hardwareLength = 6;
+
+      char senderMac[13];
+      char targetMac[13];
+
+      char senderIp[INET_ADDRSTRLEN];
+      char recieverIp[INET_ADDRSTRLEN];
+
+      snprintf(
+	      senderMac,
+	      sizeof(senderMac),
+				"%02x%02x%02x%02x%02x%02x",
+    		ahdr->senderHWAddress[0], ahdr->senderHWAddress[1],
+        ahdr->senderHWAddress[2], ahdr->senderHWAddress[3],
+        ahdr->senderHWAddress[4], ahdr->senderHWAddress[5]
+      );
+
+      snprintf(
+      	targetMac,
+       	sizeof(targetMac),
+        "%02x%02x%02x%02x%02x%02x",
+        ahdr->targetHWAddress[0], ahdr->targetHWAddress[1],
+        ahdr->targetHWAddress[2], ahdr->targetHWAddress[3],
+        ahdr->targetHWAddress[4], ahdr->targetHWAddress[5]
+      );
+
+      inet_ntop(AF_INET, &ahdr->senderProtoAddress, senderIp, sizeof(senderIp));
+      inet_ntop(AF_INET, &ahdr->targetProtoAddress, recieverIp, sizeof(recieverIp));
+
+      analyzeArpAddr(senderMac, targetMac, senderIp, recieverIp);
+
+      fprintf(stderr, "%s -> %s: ARP\n%s -> %s\n\n", senderMac, targetMac, senderIp, recieverIp);
+    }
+
+    memset(buffer, 0, sizeof(buffer));
+  }
+
+  close(sockfd);
+  return 0;
+}
